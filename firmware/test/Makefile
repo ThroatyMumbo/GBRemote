@@ -50,15 +50,12 @@ $(INSNS): $(GEN)/%_insns.h: %.pio gen_pio_insns.py
 	@mkdir -p $(GEN)
 	python3 gen_pio_insns.py $(PIOASM) $< $@
 
-$(OBJ)/%.o: %.c | $(INSNS) ../generated/padart_blobs.h
+$(OBJ)/%.o: %.c | $(INSNS)
 	@mkdir -p $(OBJ)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 run_tests: $(addprefix $(OBJ)/,$(notdir $(SRC:.c=.o)))
 	$(CC) -o $@ $^ $(LDFLAGS)
-
-../generated/padart_blobs.h:
-	@echo "firmware/generated/padart_blobs.h is missing — run ./tools/run.sh art" >&2; exit 1
 
 clean:
 	rm -f run_tests

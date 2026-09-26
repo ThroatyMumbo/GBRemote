@@ -7,7 +7,7 @@
 #include "art.h"
 #include "pad_mapinfo.h"
 #include "mapinfo.h"
-#include "generated/padart_blobs.h"
+#include "padart_blobs.h"
 
 // The controller picture at $4600: packer against the GB menu's own parser, then the menu's
 // incremental repaint against a full one.

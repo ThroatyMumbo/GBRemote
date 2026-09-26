@@ -2,7 +2,7 @@
 #include "padart_fmt.h"
 #include "cartserve.h"
 #include "vmu_fb.h"
-#include "generated/padart_blobs.h"
+#include "padart_blobs.h"
 
 // Per high bank per pass: the same order as vmu_fb.c's 192 bytes in ~6 us, inside a pass's ~12 us.
 #define ART_CHUNK 128
