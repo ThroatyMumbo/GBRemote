@@ -1,0 +1,117 @@
+; mapledev.pio — device-side Maple bus, Charlie Cole's maple.pio repacked from 39 words to 32.
+
+; maple_tx: stalls at `out y,32` with the bus released; takes sync count, bit pairs - 1, payload.
+; The frame leaves the OSR partial, so mapledev_send() restarts the SM before each reply.
+.program maple_tx
+.side_set 1
+.define public HOLD   12        ; cycles a bus state is held
+.define        SETTLE  6
+.define        MID     6
+; MaplePad's 125 MHz / 3; dc_dvd's 50 MHz lost more block reads here.
+.define public CLK_HZ 41666667
+
+.wrap_target
+    set pindirs, 0      side 1              ; release the bus
+    out y, 32           side 1 [HOLD]       ; stall here until armed; y = sync pulse count
+    set pindirs, 3      side 1              ; drive it
+
+    set pins, 2         side 1 [HOLD]       ; 0b10, SDCKA low for the whole start pattern
+syncloop:
+    nop                 side 0 [HOLD]       ; 0b00
+    jmp y-- syncloop    side 1 [HOLD]       ; 0b10
+    set pins, 3         side 1 [MID]        ; 0b11 = start
+    out x, 32           side 0 [HOLD]       ; 0b01, and x = bit pairs - 1
+
+dataloop:
+    out y, 1            side 0
+    set pins, 1         side 0 [MID-1]      ; 0b01; also the 0b00 -> 0b01 edge after a zero
+    jmp !y, send_zero   side 0
+    nop                 side 1 [SETTLE]     ; 0b11 = one
+    set pins, 2         side 1 [HOLD]       ; 0b10
+    jmp outro           side 1 [MID]
+send_zero:
+    nop                 side 0 [SETTLE]     ; pad, so both branches are 27 cycles
+    set pins, 0         side 0 [HOLD]       ; 0b00 = zero
+    nop                 side 1 [MID]        ; 0b10
+outro:
+    out pins, 1         side 1 [SETTLE]     ; second bit of the pair, straight onto SDCKA
+    jmp x-- dataloop    side 0 [HOLD-1]
+
+    set pins, 1         side 0 [HOLD]       ; 0b01
+    set y, 1            side 1 [HOLD]       ; 0b11; RX branches to its end path from here
+tailloop:
+    set pins, 1         side 0 [HOLD]       ; 0b01
+    set pins, 0         side 0 [HOLD-1]     ; 0b00
+    jmp y-- tailloop    side 0
+    set pins, 1         side 0 [HOLD]       ; 0b01
+    set pins, 3         side 1 [HOLD]       ; 0b11, back to idle
+.wrap
+
+
+; maple_rx_edge: two SMs, IN base on SDCKA and SDCKB. The lines never move together, so the shared
+; IRQ cannot lose a sample.
+.program maple_rx_edge
+    wait 0 pin 0
+    irq 7
+    wait 1 pin 0
+    irq 7
+
+
+; maple_rx_sample: one 2-bit snapshot per edge (`wait 1 irq` clears the flag); autopush at 8 packs
+; 4 samples a byte.
+.program maple_rx_sample
+    wait 1 irq 7
+    in pins, 2
+
+
+% c-sdk {
+#include "pio_run.h"
+#include "hardware/gpio.h"
+
+// Call once, before any program_init. pio_set_gpio_base(pio, 16) must already have run.
+static inline void maple_pin_init(PIO pio, uint pin_a, uint pin_b) {
+    pio_gpio_init(pio, pin_a);
+    pio_gpio_init(pio, pin_b);
+    gpio_set_slew_rate(pin_a, GPIO_SLEW_RATE_SLOW);
+    gpio_set_slew_rate(pin_b, GPIO_SLEW_RATE_SLOW);
+    // Both references pull up here and the bus idles high; ctrl.c's pulls-off default is for
+    // buses where the console owns the pull, which this one only partly does.
+    gpio_pull_up(pin_a);
+    gpio_pull_up(pin_b);
+}
+
+static inline void maple_tx_program_init(PIO pio, uint sm, uint offset, uint pin_a, uint pin_b) {
+    pio_sm_config c = maple_tx_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, pin_a, 1);       // `out pins,1` drops a data bit onto SDCKA
+    sm_config_set_set_pins(&c, pin_a, 2);       // `set pins`/`set pindirs` reach both
+    sm_config_set_sideset_pins(&c, pin_b);
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(maple_tx_CLK_HZ));
+    // Output registers high, direction in: released but ready to drive idle-high.
+    // The 64-bit forms, because the port is GP32-39 and `1u << 32` shifts to zero.
+    uint64_t mask = (1ull << pin_a) | (1ull << pin_b);
+    pio_sm_set_pins_with_mask64(pio, sm, mask, mask);
+    pio_sm_set_pindirs_with_mask64(pio, sm, 0, mask);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+// watch_pin is SDCKA on one SM and SDCKB on the other; `wait n pin 0` follows the IN base.
+static inline void maple_rx_edge_program_init(PIO pio, uint sm, uint offset, uint watch_pin) {
+    pio_sm_config c = maple_rx_edge_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, watch_pin);
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(maple_tx_CLK_HZ));
+    pio_sm_set_consecutive_pindirs(pio, sm, watch_pin, 1, false);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+static inline void maple_rx_sample_program_init(PIO pio, uint sm, uint offset, uint pin_a) {
+    pio_sm_config c = maple_rx_sample_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_a);
+    sm_config_set_in_shift(&c, false, true, 8);     // shift left, autopush @8 => oldest sample first
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(maple_tx_CLK_HZ));
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_a, 2, false);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

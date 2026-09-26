@@ -1,1 +1,9 @@
 .history/
+/build/
+firmware/build/
+firmware/generated/
+firmware/test/generated/
+firmware/test/obj/
+firmware/test/run_tests
+firmware/evmu/test/test_cpu
+firmware/evmu/test/test_cpu_san

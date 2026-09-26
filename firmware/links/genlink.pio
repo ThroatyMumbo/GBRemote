@@ -1,0 +1,72 @@
+; genlink.pio — the cart end of the Genesis throughput link. IN/OUT base is GP32 (TL), so pin 2 is
+; TH. TH stays SIO-function, which makes the OUT and pindir writes that land on it inert.
+
+.pio_version 1
+
+.program glk_rx
+public entry:
+    wait 1 pin 2                ; start from TH idle-high, whatever the previous traffic left
+.wrap_target
+    wait 0 pin 2 [31]           ; sample ~300 ns after the edge: one console write moves TH and data
+    nop          [12]
+    in pins, 7
+    wait 1 pin 2 [31]
+    nop          [12]
+    in pins, 7
+.wrap
+
+; Blind to TH for ~430 ns after every out: our own switching puts transitions on TH that glk_cnt
+; counts and the core never sees (~650 extra per 8192 symbols), and each one would advance a symbol.
+.program glk_tx
+    wait 0 pin 2                ; the go edge — the console released its data lines before moving TH
+    out pins, 7
+    mov pindirs, ~null [31]
+    nop [31]
+.wrap_target
+    wait 1 pin 2
+    out pins, 7 [31]
+    nop [31]
+    wait 0 pin 2
+    out pins, 7 [31]
+    nop [31]
+.wrap
+
+; Instrument: counts every TH transition the PIO synchronizer sees, in X, counting down from ~0.
+.program glk_cnt
+.wrap_target
+top:
+    wait 0 pin 2
+    jmp x-- c0
+c0:
+    wait 1 pin 2
+    jmp x-- top
+.wrap
+
+% c-sdk {
+static inline void glk_cnt_program_init(PIO pio, uint sm, uint offset, uint pin_base) {
+    pio_sm_config c = glk_cnt_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_base);
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(pio, sm, offset, &c);
+}
+
+// pio_set_gpio_base(pio, 16) must already have run.
+static inline void glk_rx_program_init(PIO pio, uint sm, uint offset, uint pin_base) {
+    pio_sm_config c = glk_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_base);
+    sm_config_set_in_shift(&c, false, true, 28);        // 4 symbols per word, first one on top
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(pio, sm, offset + glk_rx_offset_entry, &c);
+}
+
+static inline void glk_tx_program_init(PIO pio, uint sm, uint offset, uint pin_base) {
+    pio_sm_config c = glk_tx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_base);
+    sm_config_set_out_pins(&c, pin_base, 7);
+    sm_config_set_out_shift(&c, true, true, 28);        // symbol 0 in bits 0-6
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

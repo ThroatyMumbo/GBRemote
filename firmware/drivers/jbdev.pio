@@ -1,0 +1,92 @@
+; jbdev.pio — device-side N64 Joybus: open drain via side-set on PINDIRS, 4 us cells, MSB first.
+; jbdev_tx is the pin's only writer; jbdev_rx never drives it.
+
+; No `wait gpio`: with gpio_base 16 the literal would wait on GP16, the /RST sense line.
+
+; jbdev_rx — byte slicer; ~8 us of quiet drops the partial byte and raises IRQ 4, the resync path.
+; At 8 MHz the sample lands 1.875-2.125 us past the edge, >= 0.875 us from either bit's low end.
+.program jbdev_rx
+.define public CLK_HZ     8000000
+.define        SAMPLE_DLY 13      ; sample 15..17 cycles past the falling edge
+.define        IDLE_TO    31      ; 65 cycles = 8.1 us of quiet; max intra-frame high is 3 us
+
+public frame_end:
+    mov isr, null                 ; drop the partial byte and the input shift counter
+    irq set 4                     ; "framing just reset; the line is idle"
+.wrap_target
+    set x, IDLE_TO
+poll:
+    jmp x-- poll_pin              ; 2-cycle loop => 250 ns edge-detect granularity
+    jmp frame_end                 ; countdown expired: the frame is over
+poll_pin:
+    jmp pin poll                  ; still high, keep waiting
+    nop [SAMPLE_DLY]              ; falling edge: walk to the center of the decision window
+    in pins, 1                    ; autopush @8
+    wait 1 pin 0                  ; ride out the low half of a '0' before hunting the next edge
+.wrap
+
+
+; jbdev_tx — reply framer, idle stalled at `pull block` until the DMA is armed. `wait 1 pin 0` is an
+; interlock, not the timing; jbdev_await_stop() times the reply. `.side_set 1 opt` caps delay at [7].
+.program jbdev_tx
+.side_set 1 opt pindirs
+.define public T1     4
+.define public T2     12
+.define public CLK_HZ 4000000
+.define public TURN   4           ; TURN + T1 = 8 cycles = 2.0 us, stop-bit rise -> our first fall
+
+.wrap_target
+public idle:
+    pull block         side 0             ; stall here, line released, until the DMA is armed
+    wait 1 pin 0       side 0 [TURN - 1]  ; interlock + the pad ahead of send_bit's lead-in
+send_bit:
+    out x, 1           side 0 [T1 - 1]    ; 1 us released: the previous cell's high tail
+    jmp !x do_zero     side 1 [T1 - 1]    ; 1 us LOW
+do_one:
+    jmp !osre send_bit side 0 [T1*2 - 1]  ; release: high total 4+8 = 3 us => '1'
+    jmp send_stop            [T1 - 1]
+do_zero:
+    jmp !osre send_bit       [T1*2 - 1]   ; no side-set: stay LOW, 4+8 = 3 us => '0'
+    jmp send_stop      side 0 [T1 - 1]
+send_stop:
+    nop                side 1 [T1 - 1]    ; stop bit: 1 us LOW
+    nop                side 0             ; release, and wrap back to the blocking pull
+.wrap
+
+
+% c-sdk {
+#include "pio_run.h"
+#include "hardware/gpio.h"
+
+// Call once, before either program_init, after pio_set_gpio_base(pio, 16).
+static inline void jbdev_pin_init(PIO pio, uint pin) {
+    pio_gpio_init(pio, pin);
+    gpio_set_slew_rate(pin, GPIO_SLEW_RATE_SLOW);   // 1 us edges; no reason to ring a cable
+    // No internal pull: the pull-up is the console's, through our 100R series resistor.
+}
+
+static inline void jbdev_rx_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = jbdev_rx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);                 // `in pins,1` and `wait 1 pin 0`
+    sm_config_set_jmp_pin(&c, pin);
+    sm_config_set_in_shift(&c, false, true, 8);     // shift left, autopush @8 => MSB first
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);  // 8 deep = 256 us of core slack, free
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(jbdev_rx_CLK_HZ));
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_sm_init(pio, sm, offset + jbdev_rx_offset_frame_end, &c);
+}
+
+static inline void jbdev_tx_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = jbdev_tx_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin);                 // the `wait 1 pin 0` interlock
+    sm_config_set_sideset_pins(&c, pin);            // side-set drives PINDIRS
+    sm_config_set_set_pins(&c, pin, 1);             // for the one-shot `set pins,0` below
+    sm_config_set_out_shift(&c, false, true, 8);    // shift left, autopull @8 => MSB first
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);  // 8 deep behind the DMA
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(jbdev_tx_CLK_HZ));
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    pio_sm_init(pio, sm, offset + jbdev_tx_offset_idle, &c);
+    // Open drain needs the output register at 0 so pindir=1 drives low.
+    pio_sm_exec(pio, sm, pio_encode_set(pio_pins, 0));
+}
+%}

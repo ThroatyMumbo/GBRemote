@@ -1,0 +1,25 @@
+# Off: short names and hex constants are the house idiom, include-cleaner misreads pico-sdk's
+# umbrella headers, memset_s is not in newlib, XIP/register addresses are integers, and the
+# complex functions are the VMU interpreter and core1's timed paths.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  cert-*,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  misc-*,
+  -misc-include-cleaner,
+  performance-*,
+  -performance-no-int-to-ptr,
+  portability-*,
+  readability-*,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-magic-numbers
+CheckOptions:
+  # int8_t axes are signed on purpose; the suggested (unsigned char) cast would break them.
+  bugprone-signed-char-misuse.CharTypdefsToIgnore: 'int8_t'
+  cert-str34-c.CharTypdefsToIgnore: 'int8_t'
+HeaderFilterRegex: '/firmware/(drivers/|evmu/)?[a-z0-9_]+\.h$'
+WarningsAsErrors: ''

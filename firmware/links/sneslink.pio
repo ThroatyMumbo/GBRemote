@@ -1,0 +1,35 @@
+; sneslink.pio — a bulk link clocked by the console's $4016 reads: 2 bits out on D0/D1 per clock,
+; IOBIT in at the CLK rise. IN base = LATCH; core1 arms each frame at `start` and owns its length.
+
+.program sneslink
+.define public CLK_HZ 25000000
+
+public start:
+    wait 1 pin 1                ; CLK high: the next fall is a fresh read
+    set pins, 0                 ; ready: both lines low, $4016 & 3 == 3
+    wait 0 pin 1
+    wait 1 pin 1                ; the read that saw ready carries nothing
+.wrap_target
+    out pins, 2                 ; autopull 32: 16 symbols a word
+    wait 0 pin 1                ; the console samples D0/D1 while CLK is low
+    wait 1 pin 1
+    in pins, 3                  ; autopush 24: one byte of IOBIT a word
+.wrap
+
+% c-sdk {
+#include "pio_run.h"
+#include "hardware/gpio.h"
+
+// pio_set_gpio_base(pio, 16) must already have run. D1 = pin_d0 + 1; CLK, IOBIT follow pin_latch.
+static inline void sneslink_program_init(PIO pio, uint sm, uint offset, uint pin_d0,
+                                         uint pin_latch) {
+    pio_sm_config c = sneslink_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_latch);
+    sm_config_set_out_pins(&c, pin_d0, 2);
+    sm_config_set_set_pins(&c, pin_d0, 2);
+    sm_config_set_out_shift(&c, true, true, 32);
+    sm_config_set_in_shift(&c, false, true, 24);
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(sneslink_CLK_HZ));
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

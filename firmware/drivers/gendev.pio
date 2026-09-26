@@ -1,0 +1,89 @@
+; gendev.pio — device-side Genesis / Mega Drive pad: gen_dpad keys D0-D3 off the cycle, gen_tltr
+; keys TL/TR off the TH level, so each SM's report is one FIFO word.
+
+; No `wait gpio`/`jmp gpio`: with gpio_base 16 their indices are literals pioasm cannot fix up.
+
+.program gen_dpad
+.wrap_target
+public idle:
+    pull noblock                ; newest table word, or re-copy X if the driver has not written
+    mov x, osr
+    out pins, 4            ; cycle 1, re-emitted every pass while TH sits high
+    jmp pin, idle               ; JMP pin = TH. High -> keep looping on the freshest word
+    out pins, 4            ; cycle 2
+    wait 1 pin 0
+    out pins, 4            ; cycle 3
+    wait 0 pin 0
+    out pins, 4            ; cycle 4
+    wait 1 pin 0
+    out pins, 4            ; cycle 5
+    wait 0 pin 0
+    out pins, 4            ; cycle 6 — the 6-button ID nibble
+    wait 1 pin 0
+    out pins, 4            ; cycle 7 — Z Y X MODE
+    wait 0 pin 0
+    out pins, 4            ; cycle 8
+    wait 1 pin 0                ; TH back high; the wrap re-presents cycle 1 immediately
+.wrap
+
+; Level-locked by construction: it self-corrects within one TH edge.
+.program gen_tltr
+.wrap_target
+public idle:
+    pull noblock
+    mov x, osr
+    out pins, 2            ; TH high: B, C
+    jmp pin, idle
+    out pins, 2            ; TH low: A, START
+    wait 1 pin 0
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "hardware/pio.h"
+#include "hardware/gpio.h"
+
+// pio_set_gpio_base(pio, 16) must already have run — on this board the port is GP32-39.
+// The two programs share pin_th as both IN base and JMP pin; their OUT windows are disjoint.
+static inline void gendev_out_init(PIO pio, uint sm, pio_sm_config *c,
+                                   uint pin_out, uint n, uint pin_th) {
+    for (uint i = 0; i < n; i++) {
+        pio_gpio_init(pio, pin_out + i);
+        gpio_set_drive_strength(pin_out + i, GPIO_DRIVE_STRENGTH_12MA);
+        // No internal pull: ~60k is too weak against the cable's C. GNF_PULLUP opts in from gendev.c.
+    }
+    sm_config_set_in_pins(c, pin_th);           // `wait n pin 0` = TH
+    sm_config_set_jmp_pin(c, pin_th);
+    sm_config_set_out_pins(c, pin_out, n);
+    sm_config_set_set_pins(c, pin_out, n);      // for the one-shot `set pins,0` below
+    sm_config_set_out_shift(c, true, false, 32);        // shift right, no autopull => cycle 1 first
+    sm_config_set_clkdiv(c, 1.0f);      // untimed; the idle loop's ~20 ns blind spot is far below a TH phase
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_out, n, false);     // released until primed
+}
+
+// Level before direction, so enabling can never glitch a line low. X is reset too: the idle loop
+// serves it while the FIFO is empty. Wire levels, so released is all-ones under push-pull.
+static inline void gendev_prime(PIO pio, uint sm, uint n, bool push_pull) {
+    uint32_t all = (1u << n) - 1u;
+    pio_sm_exec(pio, sm, pio_encode_set(pio_pins, push_pull ? all : 0));
+    pio_sm_exec(pio, sm, pio_encode_set(pio_pindirs, push_pull ? all : 0));
+    pio_sm_exec(pio, sm, push_pull ? pio_encode_mov_not(pio_x, pio_null)
+                                   : pio_encode_mov(pio_x, pio_null));
+}
+
+static inline void gen_dpad_program_init(PIO pio, uint sm, uint offset, uint pin_d0, uint pin_th,
+                                         bool push_pull) {
+    pio_sm_config c = gen_dpad_program_get_default_config(offset);
+    gendev_out_init(pio, sm, &c, pin_d0, 4, pin_th);
+    pio_sm_init(pio, sm, offset + gen_dpad_offset_idle, &c);
+    gendev_prime(pio, sm, 4, push_pull);
+}
+
+static inline void gen_tltr_program_init(PIO pio, uint sm, uint offset, uint pin_tl, uint pin_th,
+                                         bool push_pull) {
+    pio_sm_config c = gen_tltr_program_get_default_config(offset);
+    gendev_out_init(pio, sm, &c, pin_tl, 2, pin_th);
+    pio_sm_init(pio, sm, offset + gen_tltr_offset_idle, &c);
+    gendev_prime(pio, sm, 2, push_pull);
+}
+%}

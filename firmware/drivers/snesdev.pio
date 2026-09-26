@@ -1,0 +1,61 @@
+; snesdev.pio — device-side SNES (16 bits) / NES (8 bits) port: open drain, so `out pindirs` takes
+; the pressed mask as-is.
+
+; No `wait gpio`/`jmp gpio`: with gpio_base 16 their indices are literals pioasm cannot fix up.
+; ISR holds the bit count; never pio_sm_restart() this SM without reloading it.
+.program snesdev
+.define public CLK_HZ 4000000   ; the 4-cycle idle loop is 1 us, so a 12 us LATCH cannot be missed
+.define public IRQ_LATCH 6
+
+.wrap_target
+    wait 0 pin 0                ; LATCH idle low — an SM started mid-pulse resyncs here
+idle:
+    pull noblock                ; newest report, or re-copy X if the driver has not written
+    mov x, osr
+    jmp pin, start              ; JMP pin = LATCH
+    jmp idle
+start:
+    irq nowait IRQ_LATCH        ; the console latched us: link_up and stats
+    mov y, isr                  ; bit count - 1, loaded once in snesdev_init()
+    out pindirs, 1              ; bit 0, valid through the first clock's low phase
+bitloop:
+    wait 0 pin 1                ; CLK falls — the console samples here
+    wait 1 pin 1                ; CLK rises — the pad shifts here
+    out pindirs, 1
+    jmp y-- bitloop             ; N passes: the last waits out the final rise so bit N-1 is not cut short
+    set pindirs, 1              ; past the last bit a 4021 reads pressed; SMAS reads a 17th bit
+.wrap
+
+% c-sdk {
+#include "pio_run.h"
+#include "hardware/gpio.h"
+
+// pio_set_gpio_base(pio, 16) must already have run — on this board the port is GP32-39.
+// pin_latch and pin_clk must be consecutive with pin_latch lower. nbits is 16 (SNES) or 8 (NES).
+static inline void snesdev_program_init(PIO pio, uint sm, uint offset, uint pin_data,
+                                        uint pin_latch, unsigned nbits) {
+    pio_gpio_init(pio, pin_data);
+    gpio_set_slew_rate(pin_data, GPIO_SLEW_RATE_SLOW);
+    // No internal pull: the pull-up is the console's, through our 100R series resistor.
+
+    pio_sm_config c = snesdev_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_latch);           // `wait n pin 0` = LATCH, `pin 1` = CLK
+    sm_config_set_jmp_pin(&c, pin_latch);
+    sm_config_set_out_pins(&c, pin_data, 1);        // `out pindirs,1`
+    sm_config_set_set_pins(&c, pin_data, 1);        // for the one-shot `set pins,0` below
+    sm_config_set_out_shift(&c, true, false, 32);   // shift right, no autopull => LSB first
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(snesdev_CLK_HZ));
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_data, 1, false);    // released
+    pio_sm_init(pio, sm, offset, &c);
+
+    // Open drain needs the output register at 0 so pindir=1 drives low.
+    pio_sm_exec(pio, sm, pio_encode_set(pio_pins, 0));
+
+    // ISR = bit count - 1, staged through X by `set`: a FIFO load would need a blocking `pull`.
+    pio_sm_exec(pio, sm, pio_encode_set(pio_x, (int)nbits - 1));
+    pio_sm_exec(pio, sm, pio_encode_mov(pio_isr, pio_x));
+
+    // Clear X, which the idle loop serves while the FIFO is empty.
+    pio_sm_exec(pio, sm, pio_encode_mov(pio_x, pio_null));
+}
+%}

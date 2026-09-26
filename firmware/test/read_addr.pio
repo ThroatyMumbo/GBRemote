@@ -1,0 +1,12 @@
+; read_addr.pio — write_capture's 26-bit layout on every read cycle, run only by the host tests.
+
+.define PIN_NRD    3     ; must match pinmap.h PIN_NRD
+.define RD_SETTLE  2     ; cycles past the /RD falling edge before latching the address
+
+; Triggered on the /RD falling edge, not on CLK: /RD is the console saying the address is settled.
+.program read_addr
+.wrap_target
+    wait 1 gpio PIN_NRD
+    wait 0 gpio PIN_NRD [RD_SETTLE]
+    in pins, 26
+.wrap

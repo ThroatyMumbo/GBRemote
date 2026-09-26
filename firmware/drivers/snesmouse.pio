@@ -1,0 +1,60 @@
+; snesmouse.pio — device-side SNES Mouse, 32 bits on snesdev.pio's pins; a speed strobe pushes an
+; all-ones word and each frame echoes the word it served.
+
+; No `wait gpio`/`jmp gpio`: gpio_base is 16 on PIO2, and pioasm cannot fix up those literals.
+
+.program snesmouse
+.define public CLK_HZ 25000000  ; 40 ns edges: a manual $4016 pulse has never been measured
+.define public IRQ_LATCH 6
+
+.wrap_target
+public top:
+    wait 0 pin 0               ; LATCH low: a strobe or a started SM resyncs here
+idle:
+    pull noblock                ; newest report, or re-copy X
+    mov x, osr
+    jmp pin frame               ; JMP pin = LATCH
+    jmp idle
+frame:
+    irq nowait IRQ_LATCH
+    set y, 31
+    out pindirs, 1              ; bit 0 on the LATCH rise
+bitloop:
+    wait 0 pin 1                ; CLK falls — the console samples here
+    jmp pin strobe              ; ...with LATCH still high: a speed strobe
+    wait 1 pin 1                ; CLK rises — shift
+    out pindirs, 1              ; the 33rd out releases the line after bit 31
+    jmp y-- bitloop
+    mov isr, x
+    push noblock                ; echo the served word
+.wrap
+strobe:
+    mov isr, ~null
+    push noblock
+    jmp top
+
+% c-sdk {
+#include "pio_run.h"
+#include "hardware/gpio.h"
+
+// pio_set_gpio_base(pio, 16) must already have run. pin_latch and pin_clk consecutive, latch lower.
+static inline void snesmouse_program_init(PIO pio, uint sm, uint offset, uint pin_data,
+                                          uint pin_latch) {
+    pio_gpio_init(pio, pin_data);
+    gpio_set_slew_rate(pin_data, GPIO_SLEW_RATE_SLOW);
+
+    pio_sm_config c = snesmouse_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_latch);
+    sm_config_set_jmp_pin(&c, pin_latch);
+    sm_config_set_out_pins(&c, pin_data, 1);
+    sm_config_set_set_pins(&c, pin_data, 1);
+    sm_config_set_out_shift(&c, true, false, 32);   // LSB first, no autopull
+    sm_config_set_in_shift(&c, false, false, 32);
+    sm_config_set_clkdiv(&c, pio_clkdiv_hz(snesmouse_CLK_HZ));
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_data, 1, false);
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_sm_exec(pio, sm, pio_encode_set(pio_pins, 0));   // output register 0: pindir 1 drives low
+    pio_sm_exec(pio, sm, pio_encode_mov(pio_x, pio_null));
+}
+%}

@@ -1,0 +1,182 @@
+; serve.pio — the cart-bus ROM responder (PIO0) and write capture + MBC5 bank select (PIO1).
+; Derived from the Croco Cartridge firmware's gameboy_bus.pio, GPLv3, (C) Sebastian Quilitz.
+
+.define PIN_CLK    1     ; must match pinmap.h PIN_CLK
+.define PIN_NWR    2     ; must match pinmap.h PIN_NWR
+.define PIN_A15    7     ; must match pinmap.h PIN_A15
+.define SETTLE_DLY 2     ; cycles past the CLK-low edge before sampling
+.define WR_SETTLE  8     ; cycles past the /WR falling edge before latching D0-D7
+
+; region_detect (jmp_pin = A15, in-base = A14): the CLK-fall trigger, kept for hw-test/capture.
+; Sampling at mid-cycle scales with bus speed without a counted delay.
+.program region_detect
+.wrap_target
+rstart:
+    wait 1 gpio PIN_CLK          ; start of an access cycle
+    wait 0 gpio PIN_CLK [SETTLE_DLY] ; CLK low: address valid (scales with bus speed)
+    jmp pin rstart               ; A15 high => $8000+ internal space, serve nothing
+    in pins, 1                   ; sample A14 (in-base = A14)
+    mov x, isr
+    mov isr, null                ; clear ISR for next cycle
+    jmp !x is_low                ; A14 == 0 => low region
+    irq set 5                    ; A14 == 1 => high region ($4000-7FFF)
+    jmp rstart
+is_low:
+    irq set 4                    ; low region ($0000-3FFF)
+.wrap
+
+; a15_detect (in-base = A15, jmp_pin = A14). Croco's trigger: A15 (ROM /CS) rises with CLK and falls as the address settles, 240 ns into a
+; single-speed cycle and 67 ns into a double one (measured on a CGB). HDMA never raises it: timed path.
+.program a15_detect
+a14_high:
+    irq set 5                    ; A14 == 1 => high region
+.wrap_target
+    wait 0 gpio PIN_CLK
+public entry:
+    wait 1 gpio PIN_CLK          ; cycle opens
+    mov isr, null
+    in pins, 1                   ; A15, ~5 cycles past the rise: after it rose, before it falls
+    mov y, isr
+    jmp !y hdma                  ; already low => an HDMA read
+    wait 0 gpio PIN_A15          ; address valid
+cont:
+    jmp pin a14_high
+    irq set 4                    ; A14 == 0 => low region
+.wrap
+public hdma:
+    jmp cont [31]                ; cartserve.c's a15_detect_timed() sets the delay from clk_sys
+
+; low-region responder (jmp_pin = nRD, in-base = A0)
+.program rom_low
+.wrap_target
+wstart_low:
+    wait 1 irq 4                 ; low region signaled (clears flag)
+    jmp pin wstart_low           ; nRD high => write cycle, don't drive; re-wait
+    in pins, 14                  ; A0-A13 -> ISR, autopush @14 -> low DMA ring
+.wrap
+
+; high-region responder (jmp_pin = nRD, in-base = A0)
+.program rom_high
+.wrap_target
+wstart_high:
+    wait 1 irq 5                 ; high region signaled (clears flag)
+    jmp pin wstart_high          ; nRD high => write cycle, don't drive; re-wait
+    in pins, 14                  ; A0-A13 -> ISR, autopush @14 -> high DMA ring
+.wrap
+
+; data driver (out-base = D0, no side-set)
+.program serve_data
+.wrap_target
+    pull block                   ; byte from a DMA ring (blocks on internal/write cycles)
+    out pins, 8                  ; D0-D7 = byte
+    mov osr, ~null
+    out pindirs, 8               ; drive D0-D7
+    wait 0 gpio PIN_CLK          ; hold across the low phase (GB sample point)
+    mov osr, null
+    wait 1 gpio PIN_CLK [3]      ; release timing
+    out pindirs, 8               ; release D0-D7 (back to input)
+.wrap
+
+; write_capture (jmp_pin = A15, in-base = A14): one `in pins,26` per /WR fall latches the whole
+; write into one FIFO word. The A15 gate keeps VRAM/WRAM write spam out of the FIFO.
+.program write_capture
+wstart:
+    wait 1 gpio PIN_NWR
+    wait 0 gpio PIN_NWR [WR_SETTLE]   ; /WR falling: let D0-D7 settle before latching
+    jmp pin wstart                    ; A15 high => internal ($8000+) write, skip
+    in pins, 26                       ; A14,A15,D0-D7,RST,junk,A0-A13 -> ISR, autopush @26
+    jmp wstart
+
+; bank_sel: pushes a $2000-$3FFF write's byte as `data << 3`, an index into the {low, high} base
+; table a DMA chain mounts with no core in the path.
+.program bank_sel
+wstart:
+    wait 1 gpio PIN_NWR
+    wait 0 gpio PIN_NWR [WR_SETTLE]
+    jmp pin chk                  ; A13 high => $2000, $6000, $A000 or $E000
+    jmp wstart
+chk:
+    in pins, 2                   ; A14, A15 (in-base = A14)
+    mov x, isr
+    mov isr, null                ; MOV to ISR clears the shift counter, so the IN below starts at 0
+    jmp !x sel                   ; both low => $2000-$3FFF, a ROM bank select
+    jmp wstart
+sel:
+    in pins, 10                  ; A14, A15, D0-D7
+    in null, 1                   ; -> 11 bits = data << 3, autopush
+    jmp wstart
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "pinmap.h"
+
+// region_detect: in-base = A14, jmp_pin = A15. No autopush: ISR is cleared by mov each cycle.
+static inline void region_detect_program_init(PIO pio, uint sm, uint off) {
+    pio_sm_config c = region_detect_program_get_default_config(off);
+    sm_config_set_in_pins(&c, PIN_A14);
+    sm_config_set_jmp_pin(&c, PIN_A15);
+    sm_config_set_in_shift(&c, false, false, 32);   // shift left, no autopush
+    pio_sm_init(pio, sm, off, &c);
+}
+
+// a15_detect: in-base = A15 (the `in pins,1`), jmp_pin = A14, entered at the CLK rise wait.
+static inline void a15_detect_program_init(PIO pio, uint sm, uint off) {
+    pio_sm_config c = a15_detect_program_get_default_config(off);
+    sm_config_set_in_pins(&c, PIN_A15);
+    sm_config_set_jmp_pin(&c, PIN_A14);
+    sm_config_set_in_shift(&c, false, false, 32);
+    pio_sm_init(pio, sm, off + a15_detect_offset_entry, &c);
+}
+
+// rom_low / rom_high share identical config: in-base = A0, jmp_pin = nRD,
+// shift left, autopush @14, RX FIFO joined for depth.
+static inline void rom_responder_config(pio_sm_config *c) {
+    sm_config_set_in_pins(c, PIN_A0);
+    sm_config_set_jmp_pin(c, PIN_NRD);
+    sm_config_set_in_shift(c, false, true, 14);     // shift left, autopush @14 bits
+    sm_config_set_fifo_join(c, PIO_FIFO_JOIN_RX);
+}
+static inline void rom_low_program_init(PIO pio, uint sm, uint off) {
+    pio_sm_config c = rom_low_program_get_default_config(off);
+    rom_responder_config(&c);
+    pio_sm_init(pio, sm, off, &c);
+}
+static inline void rom_high_program_init(PIO pio, uint sm, uint off) {
+    pio_sm_config c = rom_high_program_get_default_config(off);
+    rom_responder_config(&c);
+    pio_sm_init(pio, sm, off, &c);
+}
+
+// serve_data: out-base = D0 (8 pins), shift right, no autopull. D0-D7 are PIO-driven.
+static inline void serve_data_program_init(PIO pio, uint sm, uint off) {
+    pio_sm_config c = serve_data_program_get_default_config(off);
+    sm_config_set_out_pins(&c, PIN_D0, 8);
+    sm_config_set_out_shift(&c, true, false, 8);    // shift right, no autopull
+    for (uint p = PIN_D0; p < PIN_D0 + 8; p++) pio_gpio_init(pio, p);
+    pio_sm_set_consecutive_pindirs(pio, sm, PIN_D0, 8, false);  // input until driving
+    pio_sm_init(pio, sm, off, &c);
+}
+
+// bank_sel: in-base = A14 (GP6) so one `in pins,10` reaches A14, A15 and D0-D7; jmp_pin = A13,
+// which is PIN_A0 + the wire position of A13. Autopush @11 -> the FIFO word is `data << 3`.
+static inline void bank_sel_program_init(PIO pio, uint sm, uint off) {
+    static const uint8_t wpos[14] = A0_13_WIRE_POS;
+    pio_sm_config c = bank_sel_program_get_default_config(off);
+    sm_config_set_in_pins(&c, PIN_A14);
+    sm_config_set_jmp_pin(&c, PIN_A0 + wpos[13]);
+    sm_config_set_in_shift(&c, false, true, 11);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    pio_sm_init(pio, sm, off, &c);
+}
+
+// write_capture: GP6->bit0 .. GP31->bit25, so bit0=A14, bit1=A15, bits2-9=D0-D7, bit10=RST,
+// bit11=GP17 (ignored), bits12-25=A0-A13.
+static inline void write_capture_program_init(PIO pio, uint sm, uint off) {
+    pio_sm_config c = write_capture_program_get_default_config(off);
+    sm_config_set_in_pins(&c, PIN_A14);
+    sm_config_set_jmp_pin(&c, PIN_A15);
+    sm_config_set_in_shift(&c, false, true, 26);    // shift left, autopush @26 bits
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    pio_sm_init(pio, sm, off, &c);
+}
+%}

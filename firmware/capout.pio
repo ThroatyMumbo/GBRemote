@@ -1,0 +1,68 @@
+; capout.pio — 4-bit source-synchronous egress on CTRL3-6 (data) and CTRL0 (clock).
+; Needs pio_set_gpio_base(pio2, 16) first, so no `wait gpio` / `jmp gpio`, same as gendev.pio.
+
+.program capstream
+.side_set 1
+.wrap_target
+    out pins, 4         side 0      ; data moves only while the clock is low: half a cell of setup
+    nop                 side 1      ; clock rises mid-cell; an underrun parks it low, so read TXSTALL
+.wrap
+
+; capsniff — loopback: reads back the pads capstream drives, and never writes them.
+; The clock sits below the data pins, so it comes in on JMP_PIN rather than the IN base.
+.program capsniff
+.wrap_target
+high:
+    jmp pin, high                   ; spin while the clock is high
+low:
+    jmp pin, sample                 ; rising edge
+    jmp low
+sample:
+    in pins, 4                      ; autopush @32 = 8 nibbles per word
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "pinmap.h"
+
+// Two SM cycles per nibble, integer divider only (fractional jitters). Round to nearest: ceiling
+// turns 9.0000002 into 10 and costs 10% of the wire rate.
+static inline uint capout_clkdiv(uint32_t nibble_hz) {
+    uint32_t d = (clock_get_hz(clk_sys) + nibble_hz) / (2u * nibble_hz);
+    return d ? d : 1u;
+}
+
+static inline void capstream_program_init(PIO pio, uint sm, uint off, uint32_t nibble_hz) {
+    for (uint p = PIN_CTRL(3); p <= PIN_CTRL(6); p++) pio_gpio_init(pio, p);
+    pio_gpio_init(pio, PIN_CTRL0);
+    // pio_gpio_init() keeps ctrl_init_safe()'s 4 mA/slow; 12 mA/fast into the 100R series resistors
+    // is source-terminated, and this push-pull path has no contention for them to guard.
+    for (uint p = PIN_CTRL(3); p <= PIN_CTRL(6); p++) {
+        gpio_set_drive_strength(p, GPIO_DRIVE_STRENGTH_12MA);
+        gpio_set_slew_rate(p, GPIO_SLEW_RATE_FAST);
+    }
+    gpio_set_drive_strength(PIN_CTRL0, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_slew_rate(PIN_CTRL0, GPIO_SLEW_RATE_FAST);
+
+    pio_sm_set_consecutive_pindirs(pio, sm, PIN_CTRL(3), 4, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, PIN_CTRL0, 1, true);
+
+    pio_sm_config c = capstream_program_get_default_config(off);
+    sm_config_set_out_pins(&c, PIN_CTRL(3), 4);
+    sm_config_set_sideset_pins(&c, PIN_CTRL0);
+    sm_config_set_out_shift(&c, true, true, 32);        // shift right, autopull, low nibble first
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv_int_frac8(&c, capout_clkdiv(nibble_hz), 0);
+    pio_sm_init(pio, sm, off, &c);
+}
+
+// Loopback only. Claims no pindirs, so it cannot fight capstream.
+static inline void capsniff_program_init(PIO pio, uint sm, uint off) {
+    pio_sm_config c = capsniff_program_get_default_config(off);
+    sm_config_set_in_pins(&c, PIN_CTRL(3));
+    sm_config_set_jmp_pin(&c, PIN_CTRL0);
+    sm_config_set_in_shift(&c, true, true, 32);         // shift right to match the transmitter
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    pio_sm_init(pio, sm, off, &c);
+}
+%}
