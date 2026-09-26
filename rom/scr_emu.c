@@ -18,7 +18,7 @@
 
 #define BGMAP ((volatile uint8_t *)0x9800)
 
-static uint8_t shown_st, shown_vst, shown_seq, vmu_on, map_row, half;
+static uint8_t shown_st, shown_vst, shown_seq, blit_seq, vmu_on, map_row, half;
 static uint8_t art_on, shown_art;
 static uint8_t live[3], seen[3], shown[ART_MAX_BTN], paint_b, paint_j, paint_on;
 
@@ -260,7 +260,8 @@ static void emu_enter(void)
     map_row = 0;
     half = 0;
     shown_vst = ST_VMU_STAT;
-    shown_seq = ST_VMU_SEQ;
+    // A frame published before entry is still waiting on our $2000 write; blit it once.
+    shown_seq = (uint8_t)(ST_VMU_SEQ - 1);
     emu_paint(shown_vst);
     th_show();
 }
@@ -323,8 +324,10 @@ static void emu_run(void)
                 // VBlank writes into mode 3 and loses whatever it was copying. Start it early in
                 // VBlank or not at all; the loop spins, so the next pass catches the window.
                 if (ly <= 148) {
+                    // The frame half 0 switched to; one published since then still needs its own.
+                    if (half == 0) blit_seq = seq;
                     vmu_blit(half);
-                    if (++half == 2) { half = 0; shown_seq = seq; }
+                    if (++half == 2) { half = 0; shown_seq = blit_seq; }
                 }
             } else if (th_foot_moved() || vst != shown_vst) {
                 emu_paint(vst);
