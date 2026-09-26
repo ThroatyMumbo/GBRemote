@@ -1,0 +1,19 @@
+(version 1)
+
+(rule cart_edge_mask_relief
+    (constraint bridged_mask)
+    (condition "A.memberOfFootprint('J1')")
+    (severity ignore))
+
+(rule cart_edge_witness_strips
+    (constraint clearance (min -1mm))
+    (constraint hole_clearance (min -1mm))
+    (condition "A.memberOfFootprint('J1') && B.memberOfFootprint('J1') && (A.NetName == '' || B.NetName == '')"))
+
+(rule cart_edge_copper_to_edge
+    (constraint edge_clearance (min -1mm))
+    (condition "A.memberOfFootprint('J1') && A.NetName == ''"))
+
+(rule usbc_alignment_pegs
+    (constraint edge_clearance (min 0.25mm))
+    (condition "A.memberOfFootprint('J3') && B.memberOfFootprint('J3')"))

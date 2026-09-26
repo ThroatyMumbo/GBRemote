@@ -1,0 +1,64 @@
+(kicad_sch
+	(version 20260306)
+	(generator "eeschema")
+	(generator_version "10.0")
+	(uuid "d8d64be2-47d6-57f2-9d64-1793c79ef91b")
+	(paper "A4")
+	(title_block
+		(title "GBC Remote Controller Adapter")
+		(date "2026-09-10")
+		(rev "B")
+	)
+	(lib_symbols)
+	(sheet
+		(at 63.5 50.8)
+		(size 76.2 25.4)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0)
+		)
+		(uuid "44baaea1-8046-50ec-a9ed-bddbdfedefc4")
+		(property "Sheetname" "Adapter Head"
+			(at 63.5 50.0884 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "head.kicad_sch"
+			(at 63.5 76.9116 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "adapter"
+				(path "/d8d64be2-47d6-57f2-9d64-1793c79ef91b"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+	(embedded_fonts no)
+)

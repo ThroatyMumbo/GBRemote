@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "GBCart")(type "KiCad")(uri "${KIPRJMOD}/../lib/GBCart.pretty")(options "")(descr "Shared with the cart project — one library, two boards"))
+)
