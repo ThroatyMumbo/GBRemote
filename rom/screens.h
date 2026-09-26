@@ -9,7 +9,7 @@
 #include "ui.h"
 
 // Non-const: each is in WRAM so ui.c can read it before mapping its bank (ui.h UI_BANK). A new
-// screen is `#pragma bank 255` unless it reads $4000-$7FFF, and tools/run.sh enforces that.
+// screen is `#pragma bank 255` unless it reads $4000-$7FFF, and tools/mkromh.py enforces that.
 extern screen_t scr_root;
 extern screen_t scr_ctrl;
 extern screen_t scr_pad;
